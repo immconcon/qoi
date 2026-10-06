@@ -1,6 +1,8 @@
 #![allow(incomplete_features)]
 #![feature(explicit_tail_calls)]
 
+use std::num::TryFromIntError;
+
 use nom::{
     Parser,
     branch::alt,
@@ -9,9 +11,6 @@ use nom::{
     number::{self, Endianness},
 };
 use thiserror::Error;
-
-/// QOI end marker of 8 bytes.
-const QOI_END: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 1];
 
 const ONE: usize = 1;
 
@@ -22,37 +21,47 @@ type Pixel4 = [u8; 4];
 
 #[derive(Error, Debug)]
 pub enum Failure<E> {
-    #[error("nom failed {0}")]
+    #[error("nom parsing failed: {0}")]
     Nom(#[from] nom::Err<E>),
-    #[error("QOI file provided wrong width, height or channels")]
-    InsufficientBuffer,
-    #[error("input was malformed")]
-    MalformedInput,
+    #[error("QOI header provided wrong pixel width, pixel height or channels")]
+    HeaderLiedAboutSize,
+    #[error("byte mask input did not match any known pattern")]
+    BadPattern,
+    #[error("image is bigger than the limit of {0} bytes")]
+    ImageIsTooBig(u32),
+    #[error("Are you on 16-bit machine? lol. Anyway, image is too big: {0}")]
+    UsizeIsLessThanU32(#[from] TryFromIntError),
 }
 
-struct Qoi {
-    header: Header,
-    data: Box<[u8]>,
+pub struct Qoi {
+    pub header: Header,
+    pub data: Box<[u8]>,
 }
 
-pub fn decode(input: &[u8]) -> Result<'_, Qoi> {
-    let (mut input, header) = header(input)?;
-    // TODO: return error instead of throwing panic on >4gb image.
+/// # Errors
+///
+/// Returns
+pub fn decode(input: &[u8], byte_limit: Option<u32>) -> Result<'_, Qoi> {
+    let (input, header) = header(input)?;
     let img_bytes = header
         .width
         .checked_mul(header.height)
         .and_then(|len| len.checked_mul(header.channel as u32))
-        .expect("image should be less than 4gb");
+        .ok_or_else(|| Failure::ImageIsTooBig(byte_limit.unwrap_or(u32::MAX)))?;
 
-    let mut buffer: Box<[u8]> =
-        vec![
-            0;
-            usize::try_from(img_bytes).expect("unlucky, `usize` is not big enough for this image")
-        ]
-        .into();
-    //let mut pixel_map: [Pixel; 64] = [[0; 4]; 64];
-    //let mut prev_pixel: Pixel = [0, 0, 0, 255];
-    todo!();
+    let mut buffer: Box<[u8]> = vec![0; usize::try_from(img_bytes)?].into();
+    let (input, ()) = match header.channel {
+        Channels::Rgba => {
+            let mut pixel_map: [Pixel4; 64] = [[0; 4]; 64];
+            let mut pixel: Pixel4 = [0, 0, 0, 255];
+            loop_chomp_4chan(input, &mut pixel_map, &mut pixel, &mut buffer)
+        }
+        Channels::Rgb => {
+            let mut pixel_map: [Pixel3; 64] = [[0; 3]; 64];
+            let mut pixel: Pixel3 = [0, 0, 0];
+            loop_chomp_3chan(input, &mut pixel_map, &mut pixel, &mut buffer)
+        }
+    }?;
 
     Ok((
         input,
@@ -63,28 +72,20 @@ pub fn decode(input: &[u8]) -> Result<'_, Qoi> {
     ))
 }
 
-fn loop_chomp_3chan<'a>(
-    input: &'a [u8],
-    pixel_map: &mut [Pixel3; 64],
-    pixel: &mut Pixel3,
-    mut buffer: &mut [u8],
-) -> Result<'a, ()> {
-    const CHANNELS: usize = 3;
-    todo!()
-}
-
+/// Parse 4-channel RBGA image into `buffer`.
 fn loop_chomp_4chan<'a>(
     mut input: &'a [u8],
     pixel_map: &mut [Pixel4; 64],
     pixel: &mut Pixel4,
-    mut buffer: &mut [u8],
+    buffer: &mut [u8],
 ) -> Result<'a, ()> {
     const CHANNELS: usize = 4;
     // because QOI must be ending with 8 padding bytes,
     // we can just chomp 8 bytes and match on slices.
-    let (_, chomp) = take(8_usize)(input)?;
+    let (after_img, chomp) = take(8_usize)(input)?;
     match chomp {
-        [0, 0, 0, 0, 0, 0, 0, 1] => return Ok((&input[8..], ())),
+        // QOI end marker of 8 bytes.
+        [0, 0, 0, 0, 0, 0, 0, 1] => return Ok((after_img, ())),
         &[0b1111_1111, r, g, b, a, ..] => {
             *pixel = [r, g, b, a];
             input = &input[5..];
@@ -94,16 +95,17 @@ fn loop_chomp_4chan<'a>(
             input = &input[4..];
         }
         &[x, ..] if high2(x) == 0b11 => {
-            let bytes_run = low6(x) as usize * CHANNELS;
             // `run` is stored with bias -1;
-            // i.e. when in reality it is 1..=62 stored value is 0..62
-            let (left, right) = buffer.split_at_mut(bytes_run);
-            buffer = right;
-            input = &input[1..];
+            // i.e. when in reality it is 1..=62 stored value is 0..62.
+            let bytes_run = (low6(x) as usize + 1) * CHANNELS;
+            let (left, right) = buffer
+                .split_at_mut_checked(bytes_run)
+                .ok_or(Failure::HeaderLiedAboutSize)?;
             left.as_chunks_mut()
                 .0
                 .iter_mut()
                 .for_each(|chunk| *chunk = *pixel);
+            become loop_chomp_4chan(&input[1..], pixel_map, pixel, right)
         }
         &[x, y, ..] if high2(x) == 0b10 => {
             let green_diff = low6(x).wrapping_sub(32);
@@ -122,23 +124,24 @@ fn loop_chomp_4chan<'a>(
             input = &input[2..];
         }
         &[x, ..] if high2(x) == 0b01 => {
-            let (red_diff, green_diff, blue_diff) = diff6(x);
-            pixel[0] += red_diff;
-            pixel[1] += green_diff;
-            pixel[2] += blue_diff;
+            let (red_diff, green_diff, blue_diff) = diff_low6(x);
+            pixel[0] = pixel[0].wrapping_add(red_diff);
+            pixel[1] = pixel[1].wrapping_add(green_diff);
+            pixel[2] = pixel[2].wrapping_add(blue_diff);
             input = &input[1..];
         }
         &[x, ..] if high2(x) == 0b00 => {
             *pixel = pixel_map[x as usize % 64];
             input = &input[1..];
         }
-        _ => return Err(Failure::MalformedInput),
+        _ => return Err(Failure::BadPattern),
     }
 
+    // Write pixel into map.
     pixel_map[hash4(*pixel)] = *pixel;
-
+    // Write pixel into buffer.
     match buffer.split_first_chunk_mut() {
-        None => Err(Failure::InsufficientBuffer),
+        None => Err(Failure::HeaderLiedAboutSize),
         Some((chunk, buffer_rest)) => {
             *chunk = *pixel;
             become loop_chomp_4chan(input, pixel_map, pixel, buffer_rest)
@@ -146,29 +149,106 @@ fn loop_chomp_4chan<'a>(
     }
 }
 
-#[inline(always)]
-// Two MSB bits.
-const fn high2(x: u8) -> u8 {
-    (x & 0b1100_0000) >> 6
+/// Parse 3-channel RBG image into `buffer`.
+fn loop_chomp_3chan<'a>(
+    mut input: &'a [u8],
+    pixel_map: &mut [Pixel3; 64],
+    pixel: &mut Pixel3,
+    buffer: &mut [u8],
+) -> Result<'a, ()> {
+    const CHANNELS: usize = 3;
+    // because QOI must be ending with 8 padding bytes,
+    // we can just chomp 8 bytes and match on slices.
+    let (after_img, chomp) = take(8_usize)(input)?;
+    match chomp {
+        // QOI end marker of 8 bytes.
+        [0, 0, 0, 0, 0, 0, 0, 1] => return Ok((after_img, ())),
+        &[0b1111_1111, r, g, b, _a, ..] => {
+            *pixel = [r, g, b];
+            input = &input[5..];
+        }
+        &[0b1111_1110, r, g, b, ..] => {
+            *pixel = [r, g, b];
+            input = &input[4..];
+        }
+        &[x, ..] if high2(x) == 0b11 => {
+            // `run` is stored with bias -1;
+            // i.e. when in reality it is 1..=62 stored value is 0..62.
+            let bytes_run = (low6(x) as usize + 1) * CHANNELS;
+            let (left, right) = buffer
+                .split_at_mut_checked(bytes_run)
+                .ok_or(Failure::HeaderLiedAboutSize)?;
+            left.as_chunks_mut()
+                .0
+                .iter_mut()
+                .for_each(|chunk| *chunk = *pixel);
+            become loop_chomp_3chan(&input[1..], pixel_map, pixel, right)
+        }
+        &[x, y, ..] if high2(x) == 0b10 => {
+            let green_diff = low6(x).wrapping_sub(32);
+            // green
+            pixel[1] = pixel[1].wrapping_add(green_diff);
+            // red
+            pixel[0] = pixel[0]
+                .wrapping_add(green_diff)
+                .wrapping_sub(8)
+                .wrapping_add(high4(y));
+            // blue
+            pixel[2] = pixel[2]
+                .wrapping_add(green_diff)
+                .wrapping_sub(8)
+                .wrapping_add(low4(y));
+            input = &input[2..];
+        }
+        &[x, ..] if high2(x) == 0b01 => {
+            let (red_diff, green_diff, blue_diff) = diff_low6(x);
+            pixel[0] = pixel[0].wrapping_add(red_diff);
+            pixel[1] = pixel[1].wrapping_add(green_diff);
+            pixel[2] = pixel[2].wrapping_add(blue_diff);
+            input = &input[1..];
+        }
+        &[x, ..] if high2(x) == 0b00 => {
+            *pixel = pixel_map[x as usize % 64];
+            input = &input[1..];
+        }
+        _ => return Err(Failure::BadPattern),
+    }
+
+    // Write pixel into map.
+    pixel_map[hash3(*pixel)] = *pixel;
+    // Write pixel into buffer.
+    match buffer.split_first_chunk_mut() {
+        None => Err(Failure::HeaderLiedAboutSize),
+        Some((chunk, buffer_rest)) => {
+            *chunk = *pixel;
+            become loop_chomp_3chan(input, pixel_map, pixel, buffer_rest)
+        }
+    }
 }
-#[inline(always)]
+
+const fn high2(x: u8) -> u8 {
+    x >> 6
+}
 const fn low6(x: u8) -> u8 {
     x & 0b0011_1111
 }
-#[inline(always)]
 const fn high4(x: u8) -> u8 {
     x >> 4
 }
-#[inline(always)]
 const fn low4(x: u8) -> u8 {
     x & 0b1111
 }
-#[inline(always)]
-const fn diff6(x: u8) -> (u8, u8, u8) {
+/// Returns `(red_diff, green_diff, blue_diff)` with +2 bias already accounted for.
+const fn diff_low6(x: u8) -> (u8, u8, u8) {
     let x = low6(x);
-    (x >> 4, x >> 2 & 0b11, x & 0b11)
+    (
+        (x >> 4).wrapping_sub(2),
+        ((x >> 2) & 0b11).wrapping_sub(2),
+        (x & 0b11).wrapping_sub(2),
+    )
 }
 
+/// Parse QOI header.
 fn header(input: &[u8]) -> Result<'_, Header> {
     let channel = alt((
         value(Channels::Rgb, verify(take(ONE), |s: &[u8]| s == [3])),
@@ -206,23 +286,23 @@ fn header(input: &[u8]) -> Result<'_, Header> {
 }
 
 #[repr(C)]
-struct Header {
-    width: u32,
-    height: u32,
-    channel: Channels,
-    colorspace: ColorSpace,
+pub struct Header {
+    pub width: u32,
+    pub height: u32,
+    pub channel: Channels,
+    pub colorspace: ColorSpace,
 }
 
 #[derive(Copy, Clone)]
-#[repr(C)]
-enum Channels {
+#[repr(u8)]
+pub enum Channels {
     Rgb = 3,
     Rgba = 4,
 }
 
 #[derive(Copy, Clone)]
-#[repr(C)]
-enum ColorSpace {
+#[repr(u8)]
+pub enum ColorSpace {
     SRGBWithLinearAlpha = 0,
     AllChannelLinear = 1,
 }
