@@ -1,0 +1,17 @@
+[package]
+name = "qoi_impl"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "qoi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qoi_cli"
+path = "src/main.rs"
+
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+nom = "8.0.0"
+thiserror = "2.0.21"
