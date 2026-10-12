@@ -38,9 +38,15 @@ pub struct Qoi {
     pub data: Box<[u8]>,
 }
 
+/// Decode a QOI image from raw bytes.
+///
 /// # Errors
 ///
-/// Returns
+/// - [`Failure::Nom`]: malformed or truncated input.
+/// - [`Failure::ImageIsTooBig`]: decoded size exceeds `byte_limit`.
+/// - [`Failure::HeaderLiedAboutSize`]: header dimensions don't match encoded data.
+/// - [`Failure::UsizeIsLessThanU32`]: decoded size overflows `usize` (16-bit targets).
+/// - [`Failure::BadPattern`]: unrecognized opcode in stream.
 pub fn decode(input: &[u8], byte_limit: Option<u32>) -> Result<'_, Qoi> {
     let (input, header) = header(input)?;
     let img_bytes = header
@@ -309,8 +315,10 @@ pub enum ColorSpace {
 
 #[inline]
 const fn hash3(p: Pixel3) -> usize {
-    ((p[2]
-        .wrapping_mul(7)
+    // Alpha is always 255 for RGB images (never encoded in pixels).
+    const ALPHA_HASH: u8 = 255_u8.wrapping_mul(11) % 64; // 53
+    ((ALPHA_HASH
+        .wrapping_add(p[2].wrapping_mul(7))
         .wrapping_add(p[1].wrapping_mul(5))
         .wrapping_add(p[0].wrapping_mul(3)))
         % 64) as usize
